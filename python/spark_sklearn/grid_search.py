@@ -3,6 +3,9 @@ Class for parallelizing GridSearchCV jobs in scikit-learn
 """
 
 from collections import Sized
+
+import gc
+import sys
 import numpy as np
 
 from sklearn.base import BaseEstimator, is_classifier, clone
@@ -10,6 +13,26 @@ from sklearn.cross_validation import KFold, check_cv, _fit_and_score, _safe_spli
 from sklearn.grid_search import BaseSearchCV, _check_param_grid, ParameterGrid, _CVScoreTuple
 from sklearn.metrics.scorer import check_scoring
 from sklearn.utils.validation import _num_samples, indexable
+
+
+def get_broadcast_partitions(partition_tuples):
+    numpy_df = None
+    for partition_tuple in partition_tuples:
+        (numpy_df_str, shape, dtype) = partition_tuple.value
+        partition_df = np.fromstring(numpy_df_str, dtype=dtype)
+        partition_df = partition_df.reshape(shape)
+        if numpy_df is None:
+            numpy_df = partition_df
+        else:
+            numpy_df = np.concatenate((numpy_df, partition_df), axis=0)
+    gc.collect()
+    return numpy_df
+
+
+def broadcast_partitions_unpersist(partitions):
+    for partition in partitions:
+        partition.unpersist()
+
 
 class GridSearchCV(BaseSearchCV):
     """Exhaustive search over specified parameter values for an estimator, using Spark to
@@ -154,13 +177,14 @@ class GridSearchCV(BaseSearchCV):
 
     def __init__(self, sc, estimator, param_grid, scoring=None, fit_params=None,
                  n_jobs=1, iid=True, refit=True, cv=None, verbose=0,
-                 pre_dispatch='2*n_jobs', error_score='raise'):
+                 pre_dispatch='2*n_jobs', error_score='raise', broadcast_partition_size=10000000):
         super(GridSearchCV, self).__init__(
             estimator, scoring, fit_params, n_jobs, iid,
             refit, cv, verbose, pre_dispatch, error_score)
         self.sc = sc
         self.param_grid = param_grid
         self.grid_scores_ = None
+        self._broadcast_partition_size = broadcast_partition_size
         _check_param_grid(param_grid)
 
     def fit(self, X, y=None):
@@ -177,8 +201,27 @@ class GridSearchCV(BaseSearchCV):
             Target relative to X for classification or regression;
             None for unsupervised learning.
 
+        broadcast_partition_size : TODO: finish the doc
+
         """
         return self._fit(X, y, ParameterGrid(self.param_grid))
+
+    def _broadcast_by_partition(self, numpy_df, broadcast_partition_size=10000000):
+        partition_tuples = list()
+        start = 0
+        while start < len(numpy_df):
+            end = min(start + broadcast_partition_size, len(numpy_df))
+            partition_df = numpy_df[start:end]
+            partition_df_str = partition_df.tostring()
+            print("The partition size is {0} rows".format(broadcast_partition_size))
+            print("The length of partition_df_str is {0}".format(len(partition_df_str)))
+            print("The size in of partition_df_str is {0} bytes".format(sys.getsizeof(partition_df_str)))
+            broadcast_tuple = (partition_df_str, partition_df.shape, partition_df.dtype)
+            broadcast_tuple_bc = self.sc.broadcast(broadcast_tuple)
+            partition_tuples.append(broadcast_tuple_bc)
+            start += broadcast_partition_size
+        gc.collect()
+        return partition_tuples
 
     def _fit(self, X, y, parameter_iterable):
         """Actual fitting,  performing the search over parameters."""
@@ -213,8 +256,8 @@ class GridSearchCV(BaseSearchCV):
         # respect it.
         indexed_param_grid = list(zip(range(len(param_grid)), param_grid))
         par_param_grid = self.sc.parallelize(indexed_param_grid, len(indexed_param_grid))
-        X_bc = self.sc.broadcast(X)
-        y_bc = self.sc.broadcast(y)
+        X_bc = self._broadcast_by_partition(X, self._broadcast_partition_size)
+        y_bc = self._broadcast_by_partition(y, self._broadcast_partition_size)
 
         scorer = self.scorer_
         verbose = self.verbose
@@ -225,8 +268,8 @@ class GridSearchCV(BaseSearchCV):
         def fun(tup):
             (index, (parameters, train, test)) = tup
             local_estimator = clone(base_estimator)
-            local_X = X_bc.value
-            local_y = y_bc.value
+            local_X = get_broadcast_partitions(X_bc)
+            local_y = get_broadcast_partitions(y_bc)
             res = fas(local_estimator, local_X, local_y, scorer, train, test, verbose,
                                   parameters, fit_params,
                                   return_parameters=True, error_score=error_score)
@@ -234,8 +277,8 @@ class GridSearchCV(BaseSearchCV):
         indexed_out0 = dict(par_param_grid.map(fun).collect())
         out = [indexed_out0[idx] for idx in range(len(param_grid))]
 
-        X_bc.unpersist()
-        y_bc.unpersist()
+        broadcast_partitions_unpersist(X_bc)
+        broadcast_partitions_unpersist(y_bc)
 
         # Out is a list of triplet: score, estimator, n_test_samples
         n_fits = len(out)
